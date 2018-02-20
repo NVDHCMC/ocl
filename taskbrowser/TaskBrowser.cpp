@@ -170,6 +170,10 @@ namespace OCL
 #if defined(OROCOS_TARGET_XENOMAI) && CONFIG_XENO_VERSION_MAJOR == 2 && CONFIG_XENO_VERSION_MINOR >= 5
         if (xeno_sigwinch_handler(sig, si, ctxt) == 0)
 #endif
+
+#if defined(OROCOS_TARGET_XENOMAI) && CONFIG_XENO_VERSION_MAJOR == 3
+        if (cobalt_sigshadow_handler(sig, si, ctxt) == 0)
+#endif
             rl_resize_terminal();
     }
 
