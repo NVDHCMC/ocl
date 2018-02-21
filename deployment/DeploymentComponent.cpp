@@ -286,34 +286,54 @@ namespace OCL
     }
 
     bool DeploymentComponent::waitForInterrupt() {
-    	if ( !waitForSignal(SIGINT) )
+        int sigs[] = { SIGINT, SIGTERM, SIGHUP };
+        if ( !waitForSignals(sigs, 3) )
     		return false;
     	cout << "DeploymentComponent: Got interrupt !" <<endl;
     	return true;
     }
 
     bool DeploymentComponent::waitForSignal(int sig) {
+        return waitForSignals(&sig, 1);
+    }
+
+    bool DeploymentComponent::waitForSignals(int *sigs, std::size_t sig_count) {
 #ifdef USE_SIGNALS
-    	struct sigaction sa, sold;
-    	sa.sa_handler = ctrl_c_catcher;
-    	if ( ::sigaction(sig, &sa, &sold) != 0) {
-    		cout << "DeploymentComponent: Failed to install signal handler for signal " << sig << endl;
-    		return false;
-    	}
-    	while (got_signal != sig) {
-    		TIME_SPEC ts;
-    		ts.tv_sec = 1;
-    		ts.tv_nsec = 0;
-    		rtos_nanosleep(&ts, 0);
-    	}
-    	got_signal = -1;
-    	// reinstall previous handler if present.
-    	if (sold.sa_handler || sold.sa_sigaction)
-    		::sigaction(sig, &sold, NULL);
-    	return true;
+        struct sigaction sa, sold[sig_count];
+        std::size_t index = 0;
+        sa.sa_handler = ctrl_c_catcher;
+        for( ; index < sig_count; ++index) {
+            if ( ::sigaction(sigs[index], &sa, &sold[index]) != 0) {
+                cout << "DeploymentComponent: Failed to install signal handler for signal " << sigs[index] << endl;
+                break;
+            }
+        }
+
+        if (index == sig_count) {
+            bool break_loop = false;
+            while(!break_loop) {
+                for(std::size_t check = 0; check < sig_count; ++check) {
+                    if (got_signal == sigs[check]) break_loop = true;
+                }
+                TIME_SPEC ts;
+                ts.tv_sec = 1;
+                ts.tv_nsec = 0;
+                rtos_nanosleep(&ts, 0);
+            }
+        }
+        got_signal = -1;
+
+        // reinstall previous handlers if present.
+        while(index > 0) {
+            index--;
+            if (sold[index].sa_handler || sold[index].sa_sigaction) {
+                ::sigaction(sigs[index], &sold[index], NULL);
+            }
+        }
+        return true;
 #else
-		cout << "DeploymentComponent: Failed to install signal handler for signal " << sig << ": Not supported by this Operating System. "<<endl;
-		return false;
+        cout << "DeploymentComponent: Failed to install signal handler for signal " << sig << ": Not supported by this Operating System. "<<endl;
+        return false;
 #endif
     }
 
@@ -683,21 +703,54 @@ namespace OCL
 
     bool DeploymentComponent::kickStart(const std::string& configurationfile)
     {
+        bool              loadOk        = true;
+        bool              configureOk   = true;
+        bool              startOk       = true;
+
+        const bool rc = kickStart2(configurationfile, true, loadOk, configureOk, startOk);
+
+        // avoid compiler warnings
+        (void)loadOk;
+        (void)configureOk;
+        (void)startOk;
+
+        return rc;
+    }
+
+    bool DeploymentComponent::kickStart2(const std::string& configurationfile,
+                                         const bool         doStart,
+                                         bool&              loadOk,
+                                         bool&              configureOk,
+                                         bool&              startOk)
+    {
+        // set defaults
+        loadOk      = true;
+        configureOk = true;
+        startOk     = true;
+
         int thisGroup = nextGroup;
         ++nextGroup;    // whether succeed or fail
         if ( this->loadComponentsInGroup(configurationfile, thisGroup) ) {
             if (this->configureComponentsGroup(thisGroup) ) {
-                if ( this->startComponentsGroup(thisGroup) ) {
-                    log(Info) <<"Successfully loaded, configured and started components from "<< configurationfile <<endlog();
-                    return true;
+                if (doStart) {
+                    if ( this->startComponentsGroup(thisGroup) ) {
+                        log(Info) <<"Successfully loaded, configured and started components from "<< configurationfile <<endlog();
+                        return true;
+                    } else {
+                        log(Error) <<"Failed to start a component: aborting kick-start."<<endlog();
+                        startOk = false;
+                    }
                 } else {
-                    log(Error) <<"Failed to start a component: aborting kick-start."<<endlog();
+                    log(Info) <<"Successfully loaded and configured (but did not start) components from "<< configurationfile <<endlog();
+                    return true;
                 }
             } else {
                 log(Error) <<"Failed to configure a component: aborting kick-start."<<endlog();
+                configureOk = false;
             }
         } else {
             log(Error) <<"Failed to load a component: aborting kick-start."<<endlog();
+            loadOk = false;
         }
         return false;
     }
@@ -888,7 +941,20 @@ namespace OCL
                         assert( cp_prop.ready() );
                         if ( cp_prop.compose( comp ) ) {
                             //It's a connection policy.
-                            conmap[cp_prop.getName()].policy = cp_prop.get();
+#if defined(RTT_VERSION_GTE)
+#if RTT_VERSION_GTE(2,8,99)
+                            // Set default ConnPolicy
+                            if (cp_prop.getName() == "Default") {
+                                RTT::ConnPolicy::Default() = cp_prop.get();
+                            } else {
+#endif
+#endif
+                                conmap[cp_prop.getName()].policy = cp_prop.get();
+#if defined(RTT_VERSION_GTE)
+#if RTT_VERSION_GTE(2,8,99)
+                            }
+#endif
+#endif
                             log(Debug) << "Saw connection policy " << (*it)->getName() << endlog();
                             continue;
                         }
@@ -1246,8 +1312,13 @@ namespace OCL
         for(ConMap::iterator it = conmap.begin(); it != conmap.end(); ++it) {
             ConnectionData *connection =  &(it->second);
             std::string connection_name = it->first;
-            
-            if ( connection->ports.size() == 1) {
+
+            // Set the connection name as default name_id if none was given explicitly
+            if (connection->policy.name_id.empty()) {
+                connection->policy.name_id = connection_name;
+            }
+
+            if ( connection->ports.size() == 1 ){
                 string owner = connection->owners[0]->getName();
                 string portname = connection->ports.front()->getName();
                 string porttype = dynamic_cast<InputPortInterface*>(connection->ports.front() ) ? "InputPort" : "OutputPort";
@@ -1268,7 +1339,7 @@ namespace OCL
             // first find all write ports.
             base::PortInterface* writer = 0;
             ConnectionData::Ports::iterator p = connection->ports.begin();
-            
+
             // If one of the ports is connected, use that one as writer to connect to.
             vector<OutputPortInterface*> writers;
             while (p !=connection->ports.end() ) {
@@ -1283,18 +1354,18 @@ namespace OCL
                 }
                 ++p;
             }
-            
+
             // Inform the user of non-optimal connections:
             if ( writer == 0 ) {
                 log(Error) << "No OutputPort listed that writes " << it->first << endlog();
                 valid = false;
                 break;
             }
-            
+
             // connect all ports to writer
             p = connection->ports.begin();
             vector<OutputPortInterface*>::iterator w = writers.begin();
-            
+
             while (w != writers.end() ) {
                 while (p != connection->ports.end() ) {
                     // connect all readers to the list of writers
@@ -1318,7 +1389,7 @@ namespace OCL
         }
         return valid;
     }
-    
+
     bool DeploymentComponent::configureComponents()
     {
         RTT::Logger::In in("configureComponents");
@@ -1959,7 +2030,7 @@ namespace OCL
         }
         return false;
     }
-	
+
     bool DeploymentComponent::setActivityOnCPU(const std::string& comp_name,
                                           double period, int priority,
 					       int scheduler, unsigned int cpu_nr)
@@ -2407,7 +2478,7 @@ namespace OCL
                     log(Debug) << "Waiting for deployment shutdown to complete ..." << endlog();
                     int waited = 0;
                     while ( ( (has_operation && RTT::SendNotReady == handle.collectIfDone() ) ||
-                              (has_program && peer->getProvider<Scripting>("scripting")->isProgramRunning(NAME)) ) 
+                              (has_program && peer->getProvider<Scripting>("scripting")->isProgramRunning(NAME)) )
                             && (waited < totalWait) )
                     {
                         (void)rtos_nanosleep(&ts, NULL);
