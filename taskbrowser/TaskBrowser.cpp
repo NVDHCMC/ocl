@@ -117,12 +117,6 @@
 extern "C"
 int xeno_sigwinch_handler(int sig, siginfo_t *si, void *ctxt);
 #endif
-
-#if defined(USE_SIGNALS) && defined(OROCOS_TARGET_XENOMAI) && CONFIG_XENO_VERSION_MAJOR == 3
-extern "C"
-int cobalt_sigshadow_handler(int sig, siginfo_t *si, void *ctxt);
-#endif
-
 namespace OCL
 {
     using namespace boost;
